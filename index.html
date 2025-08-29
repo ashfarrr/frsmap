@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Response Map — Hydrants + Routing + Follow</title>
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- MarkerCluster -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <!-- Fast spatial index for k-nearest -->
+  <script src="https://unpkg.com/kdbush@4.0.2/kdbush.min.js"></script>
+  <script src="https://unpkg.com/geokdbush@4.0.0/geokdbush.min.js"></script>
+  <style>
+    :root{ --bg:#0b1020;--panel:#111831;--ink:#eef3ff;--muted:#b7c2e1;--accent:#4da3ff;--ok:#17cf7d;--warn:#ffb020; }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;overflow:hidden}
+    .app{display:grid;grid-template-rows:auto 1fr;height:100vh}
+    header{position:sticky;top:0;z-index:1000;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;padding:.5rem .75rem;border-bottom:1px solid #1b2551;background:linear-gradient(180deg,#0c1430,#0b1020)}
+    header .brand{font-weight:800;letter-spacing:.3px}
+    header .timer{margin-left:auto;background:#0f1733;border:1px solid #1b2551;border-radius:12px;padding:.3rem .6rem;font-variant-numeric:tabular-nums}
+    header .btn{background:#0f1733;border:1px solid #1b2551;color:var(--ink);border-radius:10px;padding:.35rem .6rem;cursor:pointer}
+    header .btn.primary{background:var(--accent);border-color:#2c7bd9;color:#051026;font-weight:700}
+
+    .main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);height:calc(100vh - 56px)}
+    .main.full{grid-template-columns:1fr 0 !important}
+    #map{width:100%;height:100%}
+
+    aside{height:100%;overflow:auto;background:var(--panel);border-left:1px solid #1b2551;transition:transform .25s ease}
+    aside.collapsed{transform:translateX(100%)}
+    .pane{padding:.8rem;border-bottom:1px solid #1b2551}
+    .pane h3{margin:.2rem 0 .6rem 0;font-size:1rem}
+    .small{font-size:.82rem;color:var(--muted)}
+    .list{display:grid;gap:.5rem}
+    .card{border:1px solid #22306a;background:#0f1733;border-radius:14px;padding:.5rem .6rem}
+    .row{display:flex;justify-content:space-between;gap:.5rem;align-items:center}
+    .tag{font-size:.7rem;color:#cfe1ff;background:#162352;border:1px solid #22306a;border-radius:999px;padding:.2rem .5rem}
+    .input{width:100%;padding:.45rem .6rem;border-radius:10px;border:1px solid #1b2551;background:#0c1430;color:var(--ink)}
+    .bar{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+
+    @media (max-width:900px){
+      .main{grid-template-columns:1fr;grid-template-rows:1fr}
+      #map{height:calc(100vh - 56px)}
+      aside{position:fixed;left:0;right:0;bottom:0;top:auto;max-height:55vh;z-index:1001;border-top:1px solid #1b2551;border-left:none;background:var(--panel);transform:translateY(100%)}
+      aside.open{transform:translateY(0)}
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">Response Map</div>
+    <button id="panelToggle" class="btn">Panel</button>
+    <button id="routeIncidentBtn" class="btn">Route to incident</button>
+    <button id="followBtn" class="btn">Follow me</button>
+    <button id="timerBtn" class="btn">Start timer</button>
+    <div id="timer" class="timer">00:00:00</div>
+  </header>
+
+  <div class="main">
+    <div id="map"></div>
+
+    <aside id="side">
+      <div class="pane">
+        <h3>Incident</h3>
+        <div class="bar">
+          <input id="incidentInput" class="input" type="text" placeholder="Type incident location (address, block, POI)" />
+          <button id="incidentGo" class="btn primary">Route to incident</button>
+        </div>
+      </div>
+
+      <div class="pane">
+        <h3>Hydrant search</h3>
+        <input id="hydrantSearch" class="input" list="hydrantList" placeholder="Search HYD_ID…" />
+        <datalist id="hydrantList"></datalist>
+        <div class="small">Pick the hydrant ID to zoom and label. Panel will auto-hide.</div>
+      </div>
+
+      <div class="pane">
+        <h3>Nearest hydrants</h3>
+        <div id="nearestList" class="list small"></div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script>
+// ===== CONFIG =====
+const DATA_SOURCES = [ { name: 'Hydrants', url: 'hydrants.geojson', idField: 'HYD_ID', addrField: 'LOCATION' } ];
+const PROP_LABELS = ['HYD_ID','hydrant_id','id','name','AssetID'];
+
+// ===== MAP CORE =====
+const map = L.map('map', { preferCanvas:true }).setView([1.3521,103.8198], 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 20, attribution: '&copy; OpenStreetMap' }).addTo(map);
+const cluster = L.markerClusterGroup({ showCoverageOnHover:false, chunkedLoading:true });
+let allPoints=[]; let index=null; let startMarker=null; let routeLine=null;
+const startIcon = L.divIcon({ className:'', html:'<div style="background:#17cf7d;border:2px solid #fff;width:16px;height:16px;border-radius:50%;box-shadow:0 0 0 2px rgba(23,207,125,.25)"></div>' });
+const hydrantIcon = L.icon({ iconUrl:'hydrant.svg', iconSize:[30,30], iconAnchor:[15,30], popupAnchor:[0,-28] });
+const userIcon = L.divIcon({ className:'', html:'<div style="width:14px;height:14px;border-radius:50%;background:#4da3ff;border:2px solid #fff;box-shadow:0 0 0 2px rgba(77,163,255,.3)"></div>' });
+
+function pickProp(props, keys, fallback='–'){ for(const k of keys){ if(props && props[k]!=null && props[k]!=='' ) return props[k]; } return fallback; }
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+
+// ===== Panel helpers =====
+const side=document.getElementById('side');
+const mainEl=document.querySelector('.main');
+function showPanel(){ if(window.matchMedia('(max-width:900px)').matches){ side.classList.add('open'); } else { side.classList.remove('collapsed'); mainEl.classList.remove('full'); } setTimeout(()=>map.invalidateSize(),220); }
+function hidePanel(){ if(window.matchMedia('(max-width:900px)').matches){ side.classList.remove('open'); } else { side.classList.add('collapsed'); mainEl.classList.add('full'); } setTimeout(()=>map.invalidateSize(),220); }
+function panelToggle(){ if(window.matchMedia('(max-width:900px)').matches){ side.classList.toggle('open'); } else { const collapsed=side.classList.toggle('collapsed'); mainEl.classList.toggle('full', collapsed); } setTimeout(()=>map.invalidateSize(),220); }
+document.getElementById('panelToggle').addEventListener('click', panelToggle);
+showPanel();
+window.addEventListener('resize', ()=> setTimeout(()=> map.invalidateSize(), 200));
+
+// ===== Timer =====
+let timerId=null; let startTs=null;
+function formatDur(ms){ const s=Math.floor(ms/1000); const h=String(Math.floor(s/3600)).padStart(2,'0'); const m=String(Math.floor((s%3600)/60)).padStart(2,'0'); const ss=String(s%60).padStart(2,'0'); return `${h}:${m}:${ss}`; }
+function startTimer(){ if(timerId) return; startTs=Date.now(); timerId=setInterval(()=>{ document.getElementById('timer').textContent=formatDur(Date.now()-startTs); },1000); document.getElementById('timerBtn').textContent='Running…'; }
+function resetTimer(){ if(timerId){ clearInterval(timerId); timerId=null; } document.getElementById('timer').textContent='00:00:00'; document.getElementById('timerBtn').textContent='Start timer'; }
+document.getElementById('timerBtn').addEventListener('click', ()=>{ if(timerId){ resetTimer(); } else { startTimer(); } });
+
+function setStartPoint(latlng,label='📍 Incident'){
+  if(startMarker) startMarker.remove();
+  startMarker=L.marker(latlng,{icon:startIcon}).addTo(map).bindPopup(`<b>${label}</b>`).openPopup();
+  startTimer();
+}
+
+// ===== HYDRANTS (with on-map labels by HYD_ID when zoomed in) =====
+let labelZoom = 16; // show labels from this zoom and above
+function updateLabelVisibility(){
+  const show = map.getZoom() >= labelZoom;
+  allPoints.forEach(p=>{
+    if(show){ p.marker.openTooltip(); }
+    else { p.marker.closeTooltip(); }
+  });
+}
+map.on('zoomend', updateLabelVisibility);
+
+async function loadHydrants(){
+  const src = DATA_SOURCES[0];
+  const r=await fetch(src.url); if(!r.ok) throw new Error('Failed to load hydrants');
+  const gj=await r.json();
+  const layer=L.geoJSON(gj,{
+    pointToLayer:(f,ll)=> L.marker(ll,{icon:hydrantIcon}),
+    onEachFeature:(f,l)=>{
+      const id = pickProp(f.properties, [src.idField, ...PROP_LABELS], 'Hydrant');
+      const addr = f.properties?.[src.addrField] ?? '';
+      const addrLine = addr ? `<div style='color:#345'>${escapeHtml(addr)}</div>` : '';
+      l.bindPopup(`<b>${escapeHtml(id)}</b>${addrLine}`);
+      l.bindTooltip(`${escapeHtml(id)}`, {permanent:true, direction:'top', offset:[0,-22], className:'hydrant-label'});
+    }
+  });
+  layer.eachLayer(m=>{ const ll=m.getLatLng(); allPoints.push({lat:ll.lat, lon:ll.lng, marker:m, feature:m.feature}); });
+  cluster.addLayer(layer); map.addLayer(cluster);
+  // datalist
+  const list=document.getElementById('hydrantList');
+  const frag=document.createDocumentFragment();
+  allPoints.forEach(p=>{ const id = pickProp(p.feature.properties, [DATA_SOURCES[0].idField, ...PROP_LABELS], 'Hydrant'); const opt=document.createElement('option'); opt.value=String(id); frag.appendChild(opt); });
+  list.innerHTML=''; list.appendChild(frag);
+  // spatial index for nearest
+  index = geokdbush.index(allPoints, p=>p.lon, p=>p.lat);
+  // fit once
+  if(allPoints.length){ map.fitBounds(cluster.getBounds().pad(0.05)); }
+  // apply initial label visibility
+  updateLabelVisibility();
+}
+loadHydrants();
+
+// ===== Hydrant search (auto-collapse panel) =====
+const hydrantInput = document.getElementById('hydrantSearch');
+hydrantInput.addEventListener('change', ()=>{
+  const val = hydrantInput.value.trim(); if(!val) return;
+  const found = allPoints.find(p=> String(p.feature.properties?.[DATA_SOURCES[0].idField] ?? '').toLowerCase() === val.toLowerCase());
+  if(found){
+    map.setView([found.lat, found.lon], Math.max(map.getZoom(), 18));
+    found.marker.openPopup();
+    found.marker.openTooltip();
+    hidePanel(); // <-- collapse panel after selecting a hydrant
+  }
+});
+
+// ===== Route to incident (header) + Follow =====
+let watchId=null; let userMarker=null; let accuracyCircle=null; let lastFollowRouteTs=0; 
+function updateUserMarker(a, acc){
+  if(!userMarker){ userMarker=L.marker([a.lat,a.lng],{icon:userIcon}).addTo(map); }
+  else { userMarker.setLatLng([a.lat,a.lng]); }
+  if(acc!=null){ const r=Math.max(10,Math.min(acc,200)); if(!accuracyCircle){ accuracyCircle=L.circle([a.lat,a.lng],{radius:r,color:'#4da3ff',weight:1,fillOpacity:0.08}).addTo(map);} else { accuracyCircle.setLatLng([a.lat,a.lng]); accuracyCircle.setRadius(r); } }
+}
+async function routeFromAToB(a,b){
+  const url=`https://router.project-osrm.org/route/v1/driving/${a.lng},${a.lat};${b.lng},${b.lat}?overview=full&geometries=geojson`;
+  try{ const res=await fetch(url); const json=await res.json(); if(json.code!=='Ok'||!json.routes?.length) throw 0; const r=json.routes[0]; if(routeLine) routeLine.remove(); routeLine=L.geoJSON(r.geometry,{style:{weight:6,opacity:.95}}).addTo(map); map.fitBounds(routeLine.getBounds().pad(0.1)); }catch(e){ console.warn('routing failed'); }
+}
+function startFollow(){ if(!startMarker||!('geolocation' in navigator)) return; if(watchId) return; document.getElementById('followBtn').textContent='Following…'; watchId=navigator.geolocation.watchPosition(pos=>{ const a={lat:pos.coords.latitude,lng:pos.coords.longitude}; updateUserMarker(a,pos.coords.accuracy); if(Date.now()-lastFollowRouteTs>5000){ lastFollowRouteTs=Date.now(); routeFromAToB(a,startMarker.getLatLng()); } }, err=>{ console.warn(err); stopFollow(); }, {enableHighAccuracy:true,timeout:20000,maximumAge:1000}); }
+function stopFollow(){ if(watchId){ navigator.geolocation.clearWatch(watchId); watchId=null; } document.getElementById('followBtn').textContent='Follow me'; }
+document.getElementById('followBtn').addEventListener('click', ()=>{ if(watchId) stopFollow(); else startFollow(); });
+
+document.getElementById('routeIncidentBtn').addEventListener('click', ()=>{
+  if(!startMarker) return alert('Set an incident location first (search bar).');
+  if(!('geolocation' in navigator)) return alert('No GPS available');
+  navigator.geolocation.getCurrentPosition(pos=>{ const a={lat:pos.coords.latitude,lng:pos.coords.longitude}; const b=startMarker.getLatLng(); routeFromAToB(a,b); hidePanel(); }, ()=>alert('Could not get GPS location'), {enableHighAccuracy:true,timeout:10000,maximumAge:60000});
+});
+
+// ===== Minimal incident search (uses Nominatim) =====
+document.getElementById('incidentGo').addEventListener('click', async ()=>{
+  const q=document.getElementById('incidentInput').value.trim(); if(!q) return;
+  const url=`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&addressdetails=0&limit=1`;
+  try{ const r=await fetch(url,{headers:{'Accept-Language':'en'}}); const j=await r.json(); if(!j.length) return alert('Location not found'); const p=j[0]; const ll=[parseFloat(p.lat), parseFloat(p.lon)]; if(startMarker) startMarker.remove(); startMarker=L.marker(ll,{icon:startIcon}).addTo(map).bindPopup(`<b>📍 ${escapeHtml(q)}</b>`).openPopup(); map.setView(ll,16); startTimer(); hidePanel(); startFollow(); }catch(e){ alert('Search failed'); }
+});
+</script>
+</body>
+</html>
