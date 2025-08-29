@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Response Map — Hydrants + Routing + Follow</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="https://unpkg.com/kdbush@4.0.2/kdbush.min.js"></script>
+  <script src="https://unpkg.com/geokdbush@4.0.0/geokdbush.min.js"></script>
+  <style>
+    :root{ --bg:#0b1020;--panel:#111831;--ink:#eef3ff;--muted:#b7c2e1;--accent:#4da3ff;--ok:#17cf7d;--warn:#ffb020; }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;overflow:hidden;background:var(--bg);color:var(--ink);font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    .app{display:flex;flex-direction:column;height:100%}
+    header{flex:0 0 auto;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;padding:.5rem .75rem;border-bottom:1px solid #1b2551;background:linear-gradient(180deg,#0c1430,#0b1020)}
+    header .brand{font-weight:800;letter-spacing:.3px}
+    header .timer{margin-left:auto;background:#0f1733;border:1px solid #1b2551;border-radius:12px;padding:.3rem .6rem;font-variant-numeric:tabular-nums}
+    header .btn{background:#0f1733;border:1px solid #1b2551;color:var(--ink);border-radius:10px;padding:.35rem .6rem;cursor:pointer}
+    header .btn.primary{background:var(--accent);border-color:#2c7bd9;color:#051026;font-weight:700}
+
+    .main{flex:1 1 auto;display:grid;grid-template-columns:minmax(0,1fr) 340px;height:100%}
+    .main.full{grid-template-columns:1fr 0 !important}
+    #map{width:100%;height:100%}
+
+    aside{overflow:auto;background:var(--panel);border-left:1px solid #1b2551;transition:transform .25s ease}
+    aside.hidden{display:none}
+    .pane{padding:.8rem;border-bottom:1px solid #1b2551}
+    .pane h3{margin:.2rem 0 .6rem 0;font-size:1rem}
+    .small{font-size:.82rem;color:var(--muted)}
+    .list{display:grid;gap:.5rem}
+    .card{border:1px solid #22306a;background:#0f1733;border-radius:14px;padding:.5rem .6rem}
+    .row{display:flex;justify-content:space-between;gap:.5rem;align-items:center}
+    .tag{font-size:.7rem;color:#cfe1ff;background:#162352;border:1px solid #22306a;border-radius:999px;padding:.2rem .5rem}
+    .input{width:100%;padding:.45rem .6rem;border-radius:10px;border:1px solid #1b2551;background:#0c1430;color:var(--ink)}
+    .bar{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+
+    @media (max-width:900px){
+      .main{grid-template-columns:1fr;grid-template-rows:1fr}
+      #map{height:calc(100vh - 56px)}
+      aside{position:fixed;left:0;right:0;bottom:0;top:auto;max-height:55vh;z-index:1001;border-top:1px solid #1b2551;border-left:none;background:var(--panel);transform:translateY(100%);transition:transform .25s ease}
+      aside.open{transform:translateY(0)}
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">Response Map</div>
+    <button id="panelToggle" class="btn">Panel</button>
+    <button id="routeIncidentBtn" class="btn">Route to incident</button>
+    <button id="followBtn" class="btn">Follow me</button>
+    <button id="timerBtn" class="btn">Start timer</button>
+    <div id="timer" class="timer">00:00:00</div>
+  </header>
+
+  <div class="main" id="main">
+    <div id="map"></div>
+
+    <aside id="side">
+      <div class="pane">
+        <h3>Incident</h3>
+        <div class="bar">
+          <input id="incidentInput" class="input" type="text" placeholder="Type incident location (address, block, POI)" />
+          <button id="incidentGo" class="btn primary">Route to incident</button>
+        </div>
+      </div>
+
+      <div class="pane">
+        <h3>Hydrant search</h3>
+        <input id="hydrantSearch" class="input" list="hydrantList" placeholder="Search HYD_ID…" />
+        <datalist id="hydrantList"></datalist>
+        <div class="small">Pick a hydrant ID and the map will zoom and collapse panel.</div>
+      </div>
+
+      <div class="pane">
+        <h3>Nearest hydrants</h3>
+        <div id="nearestList" class="list small"></div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script>
+const map=L.map('map').setView([1.3521,103.8198],12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:20}).addTo(map);
+
+// HYD_ID label baked into the marker so labels are always visible
+function hydrantIcon(label){
+  return L.divIcon({
+    className:'',
+    html:`<div style="position:relative;width:30px;height:30px;">
+      <img src='hydrant.svg' style='width:30px;height:30px;display:block;'>
+      <div style="position:absolute;bottom:32px;left:50%;transform:translateX(-50%);color:#fff;font-size:11px;font-weight:800;text-shadow:0 0 2px #000, 0 0 4px #000;">${label}</div>
+    </div>`
+  });
+}
+
+let allHydrants=[];
+const qs = new URLSearchParams(location.search);
+const customDataUrl = qs.get('data');
+const runSelfTest = qs.get('selftest') === '1';
+
+async function fetchFirstOk(urls){
+  for(const u of urls){
+    try{
+      const res = await fetch(u, {cache:'no-store'});
+      if(res.ok){ return await res.json(); }
+      console.warn('Fetch failed for', u, res.status);
+    }catch(e){ console.warn('Fetch error for', u, e); }
+  }
+  throw new Error('Failed to load hydrants');
+}
+
+function showLoadError(){
+  const why = (location.protocol==='file:') ? `\nTip: Open via http://localhost or GitHub Pages, not file:// (browsers block fetch from local files).` : '';
+  alert('Failed to load hydrants. Make sure hydrants.geojson is in the same folder as index.html or pass ?data=URL.'+why);
+}
+
+async function loadHydrants(){
+  try{
+    let data;
+    if(runSelfTest){
+      data = {"type":"FeatureCollection","features":[
+        {"type":"Feature","properties":{"HYD_ID":"TEST-001"},"geometry":{"type":"Point","coordinates":[103.85,1.30]}},
+        {"type":"Feature","properties":{"HYD_ID":"TEST-002"},"geometry":{"type":"Point","coordinates":[103.86,1.31]}}
+      ]};
+      console.info('Selftest dataset loaded (2 features)');
+    } else {
+      const candidates = [customDataUrl, 'hydrants.geojson', './hydrants.geojson', 'data/hydrants.geojson'].filter(Boolean);
+      data = await fetchFirstOk(candidates);
+    }
+
+    L.geoJSON(data,{
+      pointToLayer:(f,latlng)=>{
+        const id=f.properties?.HYD_ID||'';
+        const m=L.marker(latlng,{icon:hydrantIcon(id)});
+        allHydrants.push({id,marker:m,latlng});
+        return m;
+      }
+    }).addTo(map);
+
+    const list=document.getElementById('hydrantList');
+    list.innerHTML='';
+    const frag=document.createDocumentFragment();
+    allHydrants.forEach(h=>{ const opt=document.createElement('option'); opt.value=h.id; frag.appendChild(opt); });
+    list.appendChild(frag);
+
+    if(runSelfTest){
+      console.assert(allHydrants.length===2, 'Selftest: expected 2 hydrants');
+      console.assert(list.children.length===2, 'Selftest: datalist options should be 2');
+    }
+  }catch(e){
+    console.error(e);
+    showLoadError();
+  }
+}
+
+loadHydrants();
+
+// Panel control
+const side=document.getElementById('side');
+const main=document.getElementById('main');
+document.getElementById('panelToggle').addEventListener('click',()=>{
+  if(window.matchMedia('(max-width:900px)').matches){side.classList.toggle('open');}
+  else{if(main.classList.contains('full')){main.classList.remove('full');side.classList.remove('hidden');}else{main.classList.add('full');side.classList.add('hidden');}}
+});
+
+// Hydrant search (auto-collapse panel)
+const hydrantSearch=document.getElementById('hydrantSearch');
+hydrantSearch.addEventListener('change',()=>{
+  const val=hydrantSearch.value.trim();if(!val) return;
+  const found=allHydrants.find(h=>h.id.toLowerCase()===val.toLowerCase());
+  if(found){
+    map.setView(found.marker.getLatLng(),18);
+    if(window.matchMedia('(max-width:900px)').matches){side.classList.remove('open');}
+    else{main.classList.add('full');side.classList.add('hidden');}
+    setTimeout(()=>map.invalidateSize(),200);
+  }
+});
+
+window.addEventListener('resize',()=>setTimeout(()=>map.invalidateSize(),200));
+</script>
+</body>
+</html>
